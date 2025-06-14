@@ -4,6 +4,13 @@
 #include <cuda.h>
 #include <stdio.h>
 
+#define FUSELINK_CHECK_CUDA_ERR(res, msg) do { \
+    if (res != CUDA_SUCCESS) { \
+        FUSELINK_WARN("CUDA error %d: %s", res, msg); \
+        return -1; \
+    } \
+} while(false)
+
 #define FUSELINK_WARN(fmt, ...) fprintf(stderr, fmt, ##__VA_ARGS__)
 // Check CUDA RT calls
 #define FL_CUDACHECK(cmd) do {                                 \

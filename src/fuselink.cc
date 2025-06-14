@@ -14,6 +14,7 @@ void FuseLinkMemRegionInit(int nGPUs, void* base_addr, size_t size, int src_dev,
 
   size_t granularity = 0;
   size_t aligned_sz = 0;
+  // TODO: aligned sz should not be assigned here
   aligned_sz = ((size + granularity - 1) / granularity) * granularity;
   flmr->sz = aligned_sz;
 
