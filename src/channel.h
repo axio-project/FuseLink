@@ -52,10 +52,6 @@ public:
   Channel() {
     // Allocate TaskFifo in unified memory
     CUDA_CHECK(cudaMallocManaged(&_task_fifo, sizeof(CpuTaskFifo)));
-    // Initialize size_fifo to -1 (empty)
-    for (int i = 0; i < FIFO_SZ; i++) {
-        _task_fifo->fifo_flags[i] = -1;
-    }
     _task_fifo->head = 0;
     _task_fifo->tail = 0;
     // init the status as idle, so that it will pending and wait for work at the beginning.
@@ -76,10 +72,11 @@ public:
     std::unique_lock<std::mutex> lock(_mutex);
     CpuTask* result = nullptr;
     _total_tasks++;
-    if (_task_fifo->fifo_flags[_task_fifo->head % FIFO_SZ] == -1) { 
-      _task_fifo->tasks[_task_fifo->head % FIFO_SZ] = task;
-      _task_fifo->fifo_flags[_task_fifo->head % FIFO_SZ] = 1;
-      result = &_task_fifo->tasks[_task_fifo->head % FIFO_SZ];
+    if (_task_fifo->head - _task_fifo->tail < FIFO_SZ) { 
+      const int idx = _task_fifo->head % FIFO_SZ;
+      _task_fifo->tasks[idx] = task;
+      result = &_task_fifo->tasks[idx];
+      __sync_synchronize();
       _task_fifo->head++;
     } else {
       // if the fifo is full, report failure

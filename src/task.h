@@ -2,6 +2,7 @@
 #define FUSELINK_TASK_H
 
 #include <cstddef>
+#include <atomic>
 
 #define FIFO_SZ 32
 
@@ -34,7 +35,6 @@ struct CpuTaskFifo { // consumed by CPU, filled by CPU and data filled by GPU
   CpuTask tasks[FIFO_SZ];
   int head;
   int tail;
-  volatile int fifo_flags[FIFO_SZ]; // -1: empty, 1: ready
   volatile int transmit_complete_flag;
 };
 
