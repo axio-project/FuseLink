@@ -3,6 +3,8 @@
 
 #include <cstddef>
 #include <atomic>
+#include <infiniband/verbs.h>
+#include <rdma/rdma_verbs.h>
 
 #define FIFO_SZ 32
 
@@ -23,6 +25,11 @@ struct GpuTaskFifo { // consumed by GPU and filled by CPU
 };
 
 struct CpuTask {
+  struct ibv_qp* qp; // QP to send/recv data
+  struct ibv_mr* mr; // Memory region for the buffer
+  struct ibv_cq* cq; // Completion queue for the QP
+  // TODO: lkey, rkey?
+  // TODO: meta data buffer for send/recv(remFifo)
   void* buffer; // RDMA this buffer to remote or remote write to this buffer
   size_t buffer_size;
   int ring_id; // belongs to which ring (NIC)

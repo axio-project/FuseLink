@@ -154,7 +154,7 @@ void send_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], GpuT
     GpuMem mem;
     int ring_slot = 0;
     int ret = allocRingSlot(target_ring, &mem);
-    printf("write to fifo %d, head %d, mem ptr %p\n", gpu_idx, fifos[gpu_idx].head, mem.device_ptr);
+    printf("write to fifo %d, head %d, mem ptr %p\n", gpu_idx, fifos[gpu_idx].head, (void*)mem.device_ptr);
     if (ret < 0) {
       // report error and return
       printf("No free slot in the ring %d\n", target_ring_idx);
