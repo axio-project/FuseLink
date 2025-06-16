@@ -36,27 +36,24 @@ void SendChannel::threadMain() {
     }
 
     // Process tasks until done
-    while (_task_fifo->fifo_flags[_task_fifo->tail % FIFO_SZ] == 1) { // have task to process
-      int idx = _task_fifo->tail % FIFO_SZ;
-      int flag = _task_fifo->fifo_flags[idx];
+    while (_task_fifo->head > _task_fifo->tail ) { // have task to process
+      // Get the task
+      __sync_synchronize();
+      const int idx = _task_fifo->tail % FIFO_SZ;
+      CpuTask& task = _task_fifo->tasks[idx];
+        
+      // Process the task
+      // TODO: Implement actual data transmission here
+      // This is where you would handle the actual data transfer
+      // using the task.buffer and task.buffer_size
       
-      if (flag == 1 && *(_task_fifo->tasks[idx].ready_flag) == 1) {
-        // Get the task
-        CpuTask& task = _task_fifo->tasks[idx];
+      // Mark slot as empty
+      // _task_fifo->fifo_flags[idx] = -1;
+      _task_fifo->tail++;
+      _processed_tasks++;
         
-        // Process the task
-        // TODO: Implement actual data transmission here
-        // This is where you would handle the actual data transfer
-        // using the task.buffer and task.buffer_size
-        
-        // Mark slot as empty
-        // _task_fifo->fifo_flags[idx] = -1;
-        _task_fifo->tail++;
-        _processed_tasks++;
-        
-        printf("Processed task %d (%d/%d)\n", 
-                idx, _processed_tasks, _total_tasks);
-      }
+      printf("Processed task %d (%d/%d)\n", 
+              idx, _processed_tasks, _total_tasks);
     }
   }
 }
@@ -64,13 +61,12 @@ void SendChannel::threadMain() {
 int SendChannel::checkSendingStatus() {
   // TODO: implement with verbs
   int ncompleted = 0;
-  for (int i = 0; i < FIFO_SZ; i++) {
-    if (_task_fifo->fifo_flags[i] == 1) {
-      if (*(_task_fifo->tasks[i].ready_flag) == 1) {
-        ncompleted++;
-      }
-      _task_fifo->transmit_complete_flag = 1;
+  for (int i = _task_fifo->tail; i < _task_fifo->head; i++) {
+    const int idx = i % FIFO_SZ;
+    if (*(_task_fifo->tasks[idx].ready_flag) == 1) {
+      ncompleted++;
     }
+    _task_fifo->transmit_complete_flag = 1;
   }
   return ncompleted;
 }
