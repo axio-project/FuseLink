@@ -1,6 +1,13 @@
 #include "channel.h"
 #include "sendrecv.cuh"
 #include <unistd.h>
+#include "debug.h"
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <infiniband/verbs.h>
+#include <cstring>
+#include <cstdio>
 
 // Initialize global channel arrays
 SendChannel* global_send_channels[MAX_PEERS][N_CHANNELS] = {nullptr};
@@ -15,6 +22,60 @@ RecvChannel* global_recv_channels[MAX_PEERS][N_CHANNELS] = {nullptr};
 //     return 0; // TODO: implement
 // }
 
+int Channel::create_rdmaResources(struct ibv_device **dev_list, int dev_id) {
+  ctx = ibv_open_device(dev_list[dev_id]);
+  if (!ctx) {
+    fprintf(stderr, "Failed to open RDMA device.\n");
+    return -1;
+  }
+  pd = ibv_alloc_pd(ctx);
+  if (!pd) {
+    fprintf(stderr, "Failed to allocate protection domain.\n");
+    ibv_close_device(ctx);
+    return -1;
+  }
+  cq = ibv_create_cq(ctx, 10, NULL, NULL, 0);
+  if (!cq) {
+    fprintf(stderr, "Failed to create completion queue.\n");
+    ibv_dealloc_pd(pd);
+    ibv_close_device(ctx);
+    return -1;
+  }
+  struct ibv_qp_init_attr qp_init_attr = {};
+  qp_init_attr.send_cq = cq;
+  qp_init_attr.recv_cq = cq;
+  qp_init_attr.qp_type = IBV_QPT_RC;
+  qp_init_attr.cap.max_send_wr = 10;
+  qp_init_attr.cap.max_recv_wr = 10;
+  qp_init_attr.cap.max_send_sge = 1;
+  qp_init_attr.cap.max_recv_sge = 1;
+  qp = ibv_create_qp(pd, &qp_init_attr);
+  if (!qp) {
+    fprintf(stderr, "Failed to create queue pair.\n");
+    ibv_destroy_cq(cq);
+    ibv_dealloc_pd(pd);
+    ibv_close_device(ctx);
+    return -1;
+  }
+
+  struct ibv_qp_attr qp_attr = {};
+  qp_attr.qp_state = IBV_QPS_INIT;
+  qp_attr.port_num = 1;
+  qp_attr.pkey_index = 0;
+  qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+  if (ibv_modify_qp(qp, &qp_attr,
+                    IBV_QP_STATE | IBV_QP_PORT | IBV_QP_PKEY_INDEX |
+                        IBV_QP_ACCESS_FLAGS)) {
+    fprintf(stderr, "Failed to modify QP to INIT state.\n");
+    ibv_destroy_qp(qp);
+    ibv_destroy_cq(cq);
+    ibv_dealloc_pd(pd);
+    ibv_close_device(ctx);
+    return -1;
+  }
+  return 0;
+}
+
 // SendChannel class implementation
 SendChannel::SendChannel() : Channel() {
     // Base class constructor handles initialization
@@ -22,6 +83,122 @@ SendChannel::SendChannel() : Channel() {
 
 SendChannel::~SendChannel() {
     // Base class destructor handles cleanup
+}
+
+int SendChannel::create_rdmaResources(struct ibv_device **dev_list,
+                                      int dev_id) {
+  int ret = Channel::create_rdmaResources(dev_list, dev_id);
+  if (ret < 0) {
+    fprintf(stderr, "Failed to create RDMA resources for SendChannel.\n");
+    return ret;
+  }
+  _send_comm.fifoHead = 0;
+  _send_comm.fifoMr = ibv_reg_mr(
+      pd, &_send_comm.fifo, sizeof(_send_comm.fifo),
+      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+  if (!_send_comm.fifoMr) {
+    fprintf(stderr, "Failed to register memory region for SendChannel.\n");
+    ibv_destroy_qp(qp);
+    ibv_destroy_cq(cq);
+    ibv_dealloc_pd(pd);
+    ibv_close_device(ctx);
+    return -1;
+  }
+  return 0;
+}
+
+int SendChannel::Connect(int port) {
+  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sockfd < 0) {
+    perror("socket");
+    return -1;
+  }
+
+  struct sockaddr_in addr = {0};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  int ret = bind(sockfd, (struct sockaddr *)&addr, sizeof(addr));
+  if (ret < 0) {
+    perror("bind");
+    close(sockfd);
+    return -1;
+  }
+  ret = listen(sockfd, 1);
+  if (ret < 0) {
+    perror("listen");
+    close(sockfd);
+    return -1;
+  }
+  int connfd = accept(sockfd, NULL, NULL);
+
+  struct {
+    uint32_t qp_num;
+    union ibv_gid gid;
+    uint64_t fifo_addr;
+    uint32_t rkey;
+  } local, remote;
+
+  if (ibv_query_gid(ctx, 1, 0, &local.gid)) {
+    fprintf(stderr, "ibv_query_gid failed\n");
+    close(connfd);
+    close(sockfd);
+    return -1;
+  }
+  local.qp_num = qp->qp_num;
+  local.fifo_addr = (uint64_t)&_send_comm.fifo;
+  local.rkey = _send_comm.fifoMr->rkey;
+
+  write(connfd, &local, sizeof(local));
+  read(connfd, &remote, sizeof(remote));
+
+  DEBUG_PRINT("Local QP: num=%u, gid=%s, fifo_addr=%lu, rkey=%u\n",
+              local.qp_num, inet_ntoa(*(struct in_addr *)&local.gid.global.subnet_prefix),
+              local.fifo_addr, local.rkey);
+  DEBUG_PRINT("Remote QP: num=%u, gid=%s, fifo_addr=%lu, rkey=%u\n",
+              remote.qp_num, inet_ntoa(*(struct in_addr *)&remote.gid.global.subnet_prefix),
+              remote.fifo_addr, remote.rkey);
+  struct ibv_qp_attr attr = {};
+  attr.qp_state = IBV_QPS_RTR;
+  attr.path_mtu = IBV_MTU_1024;
+  attr.rq_psn = 0;
+  attr.dest_qp_num = remote.qp_num;
+  attr.max_dest_rd_atomic = 1;
+  attr.min_rnr_timer = 12;
+  attr.ah_attr.is_global = 1;
+  attr.ah_attr.dlid = 0;
+  attr.ah_attr.port_num = 1;
+  attr.ah_attr.grh.dgid = remote.gid;
+  attr.ah_attr.grh.sgid_index = 0;
+  attr.ah_attr.grh.hop_limit = 1;
+
+  if (ibv_modify_qp(qp, &attr,
+                    IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_RQ_PSN |
+                        IBV_QP_DEST_QPN | IBV_QP_MAX_DEST_RD_ATOMIC |
+                        IBV_QP_MIN_RNR_TIMER)) {
+    perror("ibv_modify_qp");
+    fprintf(stderr, "Failed to modify QP to RTR state.\n");
+    close(connfd);
+    close(sockfd);
+    return -1;
+  }
+
+  memset(&attr, 0, sizeof(attr));
+  attr.qp_state = IBV_QPS_RTS;
+  attr.timeout = 14;
+  attr.retry_cnt = 7;
+  attr.rnr_retry = 7;
+  attr.sq_psn = 0;
+  attr.max_rd_atomic = 1;
+  if (ibv_modify_qp(qp, &attr,
+        IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+        IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC)) {
+        fprintf(stderr, "Failed to modify QP to RTS\n");
+        exit(EXIT_FAILURE);
+    } else {
+        DEBUG_PRINT("QP state changed from RTR to RTS.\n");
+    }
+  return 0;
 }
 
 void SendChannel::threadMain() {
@@ -78,6 +255,115 @@ RecvChannel::RecvChannel() : Channel() {
 
 RecvChannel::~RecvChannel() {
     // Base class destructor handles cleanup
+}
+
+int RecvChannel::create_rdmaResources(struct ibv_device **dev_list,
+                                      int dev_id) {
+  int ret = Channel::create_rdmaResources(dev_list, dev_id);
+  if (ret < 0) {
+    fprintf(stderr, "Failed to create RDMA resources for RecvChannel.\n");
+    return ret;
+  }
+  _rem_fifo.fifoTail = 0;
+  _rem_fifo.mr = ibv_reg_mr(
+      pd, &_rem_fifo.elems, sizeof(_rem_fifo.elems),
+      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+  if (!_rem_fifo.mr) {
+    fprintf(stderr, "Failed to register memory region for RecvChannel.\n");
+    ibv_destroy_qp(qp);
+    ibv_destroy_cq(cq);
+    ibv_dealloc_pd(pd);
+    ibv_close_device(ctx);
+    return -1;
+  }
+  return 0;
+}
+
+int RecvChannel::Connect(const char *peer_ip, int peer_port) {
+  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sockfd < 0) {
+    perror("socket");
+    return -1;
+  }
+
+  struct sockaddr_in addr = {0};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(peer_port);
+  inet_pton(AF_INET, peer_ip, &addr.sin_addr);
+
+  if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    perror("connect");
+    close(sockfd);
+    return -1;
+  }
+
+  struct {
+    uint32_t qp_num;
+    union ibv_gid gid;
+    uint64_t fifo_addr;
+    uint32_t rkey;
+  } local, remote;
+
+  if (ibv_query_gid(ctx, 1, 0, &local.gid)) {
+    fprintf(stderr, "ibv_query_gid failed\n");
+    close(sockfd);
+    return -1;
+  }
+  local.qp_num = qp->qp_num;
+
+  read(sockfd, &remote, sizeof(remote));
+  write(sockfd, &local, sizeof(local));
+  DEBUG_PRINT("Local QP: num=%u, gid=%s, fifo_addr=%lu, rkey=%u\n",
+              local.qp_num, inet_ntoa(*(struct in_addr *)&local.gid.global.subnet_prefix),
+              local.fifo_addr, local.rkey);
+  DEBUG_PRINT("Remote QP: num=%u, gid=%s, fifo_addr=%lu, rkey=%u\n",
+              remote.qp_num, inet_ntoa(*(struct in_addr *)&remote.gid.global.subnet_prefix),
+              remote.fifo_addr, remote.rkey);
+
+  _rem_fifo.addr = remote.fifo_addr;
+  _rem_fifo.rkey = remote.rkey;
+
+  struct ibv_qp_attr attr = {};
+  attr.qp_state = IBV_QPS_RTR;
+  attr.path_mtu = IBV_MTU_1024;
+  attr.rq_psn = 0;
+  attr.dest_qp_num = remote.qp_num;
+  attr.max_dest_rd_atomic = 1;
+  attr.min_rnr_timer = 12;
+  attr.ah_attr.is_global = 1;
+  attr.ah_attr.dlid = 0;
+  attr.ah_attr.port_num = 1;
+  attr.ah_attr.grh.dgid = remote.gid;
+  attr.ah_attr.grh.sgid_index = 0;
+  attr.ah_attr.grh.hop_limit = 1;
+
+  if (ibv_modify_qp(qp, &attr,
+                    IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_RQ_PSN |
+                        IBV_QP_DEST_QPN | IBV_QP_MAX_DEST_RD_ATOMIC |
+                        IBV_QP_MIN_RNR_TIMER)) {
+    perror("ibv_modify_qp");
+    fprintf(stderr, "Failed to modify QP to RTR state.\n");
+    close(sockfd);
+    return -1;
+  }
+
+  memset(&attr, 0, sizeof(attr));
+  attr.qp_state = IBV_QPS_RTS;
+  attr.timeout = 14;
+  attr.retry_cnt = 7;
+  attr.rnr_retry = 7;
+  attr.sq_psn = 0;
+  attr.max_rd_atomic = 1;
+  if (ibv_modify_qp(qp, &attr,
+                    IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                        IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
+                        IBV_QP_MAX_QP_RD_ATOMIC)) {
+    fprintf(stderr, "Failed to modify QP to RTS\n");
+    exit(EXIT_FAILURE);
+  } else {
+    DEBUG_PRINT("QP state changed from RTR to RTS.\n");
+  }
+  return 0;
 }
 
 void RecvChannel::threadMain() {

@@ -1,4 +1,5 @@
 #include "net.h"
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <infiniband/verbs.h>
@@ -29,7 +30,7 @@ void IbTest(struct CpuTask **task, int num_tasks, int *mask) {
     }
 }
 
-void IbSend(struct CpuTask *task, struct IbSendComm *sendComm) {
+void IbSend(void *buffer, size_t buffer_size, struct ibv_mr *mr, struct ibv_qp* qp, struct IbSendComm *sendComm) {
     int slot = sendComm->fifoHead % MAX_REQUESTS;
     uint64_t idx = sendComm->fifoHead + 1;
     struct SendFifo *localElem = &sendComm->fifo[slot];
@@ -41,9 +42,9 @@ void IbSend(struct CpuTask *task, struct IbSendComm *sendComm) {
     struct ibv_send_wr *bad_wr;
     struct ibv_sge sge = {};
 
-    sge.addr = (uintptr_t)task->buffer;
-    sge.length = task->buffer_size;
-    sge.lkey = task->mr->lkey;
+    sge.addr = (uintptr_t)buffer;
+    sge.length = buffer_size;
+    sge.lkey = mr->lkey;
 
     wr.wr.rdma.remote_addr = localElem->addr;
     wr.wr.rdma.rkey = localElem->rkey;
@@ -53,13 +54,13 @@ void IbSend(struct CpuTask *task, struct IbSendComm *sendComm) {
     wr.sg_list = &sge;
     wr.num_sge = 1;
 
-    siganl_wr.wr_id = (uintptr_t)task;
+    siganl_wr.wr_id = (uintptr_t)sendComm;
     siganl_wr.opcode = IBV_WR_SEND_WITH_IMM;
-    siganl_wr.imm_data = task->buffer_size;
+    siganl_wr.imm_data = buffer_size;
     siganl_wr.next = NULL;
     siganl_wr.send_flags = IBV_SEND_SIGNALED;
 
-    int ret = ibv_post_send(task->qp, &wr, &bad_wr);
+    int ret = ibv_post_send(qp, &wr, &bad_wr);
     if (ret) {
         fprintf(stderr, "Failed to post send: %d\n", ret);
         return; // Handle error appropriately
@@ -69,29 +70,30 @@ void IbSend(struct CpuTask *task, struct IbSendComm *sendComm) {
     sendComm->fifoHead++;
 }
 
-void IbRecv(struct CpuTask* task, struct RemFifo* remFifo) {
+void IbRecv(void* buffer, size_t buffer_size, struct ibv_mr *mr, struct ibv_qp *qp, struct RemFifo* remFifo) {
     struct ibv_send_wr wr = {};
     struct ibv_send_wr* bad_wr;
 
     const int slot = remFifo->fifoTail % MAX_REQUESTS;
     struct SendFifo* localElem = &remFifo->elems[slot];
 
-    localElem->addr = (uint64_t)task->buffer;
-    localElem->rkey = task->mr->rkey;
-    localElem->size = task->buffer_size; // Sanity/Debugging
+    localElem->addr = (uint64_t)buffer;
+    localElem->rkey = mr->rkey;
+    localElem->size = buffer_size; // Sanity/Debugging
     localElem->idx = remFifo->fifoTail + 1; // idx is used to track the order of requests
 
-    wr.wr_id = (uintptr_t)task;
+    wr.wr_id = (uintptr_t)remFifo;
     wr.wr.rdma.remote_addr = remFifo->addr + slot * sizeof(struct SendFifo);
     wr.wr.rdma.rkey = remFifo->rkey;
     remFifo->sge.addr = (uintptr_t)localElem;
     remFifo->sge.length = sizeof(struct SendFifo);
+    remFifo->sge.lkey = remFifo->mr->lkey;
     wr.sg_list = &remFifo->sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_WRITE;
     wr.send_flags = IBV_SEND_INLINE;
 
-    int ret = ibv_post_send(task->qp, &wr, &bad_wr);
+    int ret = ibv_post_send(qp, &wr, &bad_wr);
     if (ret) {
         fprintf(stderr, "Failed to post send: %d\n", ret);
         return; // Handle error appropriately

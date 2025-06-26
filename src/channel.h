@@ -1,6 +1,9 @@
 #ifndef FUSELINK_CHANNEL_H
 #define FUSELINK_CHANNEL_H
 
+#include <algorithm>
+#include <infiniband/verbs.h>
+#include "net.h"
 #include <thread>
 #include <atomic>
 #include <condition_variable>
@@ -103,6 +106,8 @@ public:
     // return 0;
   }
 
+  int create_rdmaResources(struct ibv_device **dev_list, int dev_id);
+
   // Get number of processed tasks
   int getProcessedTasks() const {
     return _processed_tasks;
@@ -128,6 +133,10 @@ protected:
   int _total_tasks;      // Total number of tasks to process
   int _processed_tasks;  // Number of tasks processed so far
   int _finished_tasks;   // ..
+  ibv_context* ctx = nullptr; // RDMA context
+  ibv_pd* pd = nullptr; // Protection domain
+  ibv_cq* cq = nullptr; // Completion queue
+  ibv_qp* qp = nullptr; // Queue pair
   std::condition_variable _cv;
   std::mutex _mutex;
 };
@@ -136,20 +145,26 @@ class SendChannel: public Channel {
 public:
   SendChannel();
   int checkSendingStatus();
+  int create_rdmaResources(struct ibv_device **dev_list, int dev_id);
+  int Connect(int port);
   virtual ~SendChannel() override;
   void threadMain() override;
 private:
   std::thread _thread;
+  struct IbSendComm _send_comm;
 };
 
 class RecvChannel: public Channel {
 public:
   RecvChannel();
+  int Connect(const char* peer_ip, int peer_port);
+  int create_rdmaResources(struct ibv_device **dev_list, int dev_id);
   virtual ~RecvChannel() override;
   void threadMain() override;
 
 private:
   std::thread _thread;
+  struct RemFifo _rem_fifo;
 };
 
 extern SendChannel* global_send_channels[MAX_PEERS][N_CHANNELS];
