@@ -2,9 +2,40 @@
 #define FUSELINK_TASK_H
 
 #include <cstddef>
-#include <atomic>
+#include <cuda_runtime.h>
+#include <cuda.h>
+// #include <cuda>
 
 #define FIFO_SZ 32
+#define N_BLOCK_PER_FIFO 8
+
+enum TaskStage {
+  TASK_STAGE_COPY, // ready to copy
+  TASK_STAGE_TRANSMIT, // ready to transmit via RDMA
+  TASK_STAGE_TRANSMIT_PENDING, // waiting for RDMA to complete
+  TASK_STAGE_RECEIVED, // received by remote
+  TASK_STAGE_FINISH, // transmit done or consume done
+  TASK_STAGE_INVALID, // empty slot, should not be in tail <-> head window
+};
+
+struct GeneralTask {
+  void* buffer;
+  size_t buffer_size;
+  unsigned int ring_id; // belongs to which ring (NIC)
+  unsigned int buffer_slot;
+  TaskStage stage;
+  int chunk_id;
+  alignas(128) char padding[128];  // Ensure cache line alignment
+};
+
+struct alignas(128) GeneralTaskFifo {
+  alignas(128) GeneralTask tasks[FIFO_SZ];
+  uint64_t head;
+  volatile uint64_t tail; // both head and tail is updated on control thread
+  uint64_t tail_per_block[N_BLOCK_PER_FIFO];
+  alignas(128) char padding[128];  // Ensure cache line alignment
+};
+
 
 struct GpuTask {
   void* buffer; // GPU write to this buffer

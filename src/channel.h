@@ -2,7 +2,6 @@
 #define FUSELINK_CHANNEL_H
 
 #include <thread>
-#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <cuda_runtime.h>
@@ -83,6 +82,30 @@ public:
       printf("Channel fifo is full\n");
     }
     _state = ChannelState::WORKING;
+    lock.unlock();
+    _cv.notify_one();
+    return result;
+  }
+
+  GeneralTask* setTask_general(GeneralTask &task) {
+    std::unique_lock<std::mutex> lock(_mutex);
+    GeneralTask* result = nullptr;
+    int write_idx = _general_task_fifo->head;
+    int read_idx = _general_task_fifo->tail;
+    if (write_idx - read_idx < FIFO_SZ) {
+      const int idx = write_idx % FIFO_SZ;
+      _general_task_fifo->tasks[idx] = task;
+      __sync_synchronize();  // tasks must update before head
+      _general_task_fifo->head = write_idx + 1;
+      result = &_general_task_fifo->tasks[idx];
+    } else {
+      printf("General channel fifo is full\n");
+      lock.unlock();
+      return nullptr;
+    }
+    _total_tasks++;
+    _state = ChannelState::WORKING;
+    lock.unlock();
     _cv.notify_one();
     return result;
   }
@@ -93,14 +116,45 @@ public:
   }
 
   int setDoneIfAllFinished() {
-    // lock mutex and check if all tasks finished
-    // if (_finished_tasks == _total_tasks) {
     std::unique_lock<std::mutex> lock(_mutex);
     _state = ChannelState::DONE;
+    lock.unlock();
     _cv.notify_one();
     return 1;
-    // }
-    // return 0;
+  }
+
+  int updateTaskFifoTail() {
+    auto read_idx = _general_task_fifo->tail;
+    auto write_idx = _general_task_fifo->head;
+    while (_general_task_fifo->tasks[read_idx].stage == TASK_STAGE_FINISH && read_idx < write_idx) {
+      read_idx++;
+    }
+    _general_task_fifo->tail = read_idx;
+    __sync_synchronize();
+    return read_idx;
+  }
+
+  int setDoneIfAllFinished_general() {
+    auto read_idx = _general_task_fifo->tail;
+    auto write_idx = _general_task_fifo->head;
+    while (_general_task_fifo->tasks[read_idx].stage == TASK_STAGE_FINISH && read_idx < write_idx) {
+      read_idx++;
+    }
+    _general_task_fifo->tail = read_idx;
+    __sync_synchronize();
+    if (read_idx == write_idx) {
+      // printf("Channel is done\n");
+      std::unique_lock<std::mutex> lock(_mutex);
+      _state = ChannelState::DONE;
+      lock.unlock();
+      _cv.notify_one();
+      return 1;
+    }
+    return 0;
+  }
+
+  void setGeneralTaskFifo(GeneralTaskFifo* fifo) {
+    _general_task_fifo = fifo;
   }
 
   // Get number of processed tasks
@@ -119,17 +173,18 @@ public:
 
   // run until processed all tasks
   virtual void threadMain() = 0;
+  virtual void threadMain_general() = 0;
 
 protected:
   // interactions with gpu
-  // TaskFifo* _task_fifo;  // Unified memory pointer
+  GeneralTaskFifo* _general_task_fifo; // in unified memory, accessed by gpu and cpu
   CpuTaskFifo* _task_fifo; // new
   ChannelState _state;   // Current channel state
   int _total_tasks;      // Total number of tasks to process
   int _processed_tasks;  // Number of tasks processed so far
   int _finished_tasks;   // ..
   std::condition_variable _cv;
-  std::mutex _mutex;
+  std::mutex _mutex; // use cv and mutex to avoid infinite loop of cpu threads
 };
 
 class SendChannel: public Channel {
@@ -138,6 +193,7 @@ public:
   int checkSendingStatus();
   virtual ~SendChannel() override;
   void threadMain() override;
+  void threadMain_general() override;
 private:
   std::thread _thread;
 };
@@ -147,6 +203,7 @@ public:
   RecvChannel();
   virtual ~RecvChannel() override;
   void threadMain() override;
+  void threadMain_general() override;
 
 private:
   std::thread _thread;
@@ -154,8 +211,6 @@ private:
 
 extern SendChannel* global_send_channels[MAX_PEERS][N_CHANNELS];
 extern RecvChannel* global_recv_channels[MAX_PEERS][N_CHANNELS];
-
-// void init_channels
 
 void allocate_channels(int peer_id, int n_channels, void** channel_array, int channel_type);
 
@@ -168,6 +223,7 @@ rings: pointer to the NIC rings array, same size as the channels
 */
 
 void send_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], GpuTaskFifo fifos[], NicRing* rings[], int n_channels);
+void send_task_dispatcher_general(void* buffer, size_t sz, SendChannel* channels[], GeneralTaskFifo fifos[], NicRing* rings[], int n_channels, bool verify=false);
 void recv_task_dispatcher(void* buffer, size_t sz, RecvChannel* channels[], void* rings[], int n_channels);
 // no need to deallocate channels, the channels will be released after the transmission finishes.
 

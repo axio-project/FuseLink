@@ -57,7 +57,7 @@ void initNicRing(NicRing* ring, uint32_t nic_id) {
   // initialize gpu mems
   for (int i = 0; i < RING_SIZE; i++) {
     // TODO: Replace with a macro
-    initGpuMem(&ring->gpu_mems[i], (1 << 19), nic_id);
+    initGpuMem(&ring->gpu_mems[i], FUSELINK_CHUNK_SZ, nic_id);
   }
 }
 
@@ -81,7 +81,7 @@ int allocRingSlot(NicRing* ring, GpuMem* mem) {
   }
   if (target_slot == -1) {
     // error
-    printf("Error: NicRing is full\n");
+    // printf("Error: NicRing is full\n");
     return -1;
   }
   ring->gpu_mems[target_slot]->in_use = 1;
