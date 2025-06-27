@@ -28,8 +28,8 @@ struct RemFifo {
   struct ibv_sge sge; // lkey should be mr's lkey
 };
 
-void IbSend(struct CpuTask *task, struct IbSendComm *sendComm);
-void IbRecv(struct CpuTask* task, struct RemFifo* remFifo);
-void IbTest(struct CpuTask **task, int num_tasks, int *mask);
+void IbSend(void *buffer, size_t buffer_size, struct ibv_mr *mr, struct ibv_qp* qp, struct IbSendComm *sendComm, uint64_t wr_id);
+void IbRecv(void* buffer, size_t buffer_size, struct ibv_mr *mr, struct ibv_qp *qp, struct RemFifo* remFifo, uint64_t wr_id);
+void IbTest(uint64_t *wr_ids, int num_tasks, int *mask, struct ibv_cq *cq);
 
 #endif

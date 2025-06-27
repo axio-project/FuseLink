@@ -12,6 +12,7 @@
 #include "task.h"
 #include "debug.h"
 #include "device.h"
+#include "net.h"
 
 #define N_CHANNELS 16
 #define MAX_PEERS 16
@@ -107,6 +108,16 @@ public:
   }
 
   int create_rdmaResources(struct ibv_device **dev_list, int dev_id);
+
+  struct ibv_mr* reg_mr(void* addr, size_t size, int access_flags) {
+    // Register memory region for RDMA
+    struct ibv_mr* mr = ibv_reg_mr(pd, addr, size, access_flags);
+    if (!mr) {
+      fprintf(stderr, "Failed to register memory region.\n");
+      return nullptr;
+    }
+    return mr;
+  }
 
   // Get number of processed tasks
   int getProcessedTasks() const {
