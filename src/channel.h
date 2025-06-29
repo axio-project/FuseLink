@@ -1,6 +1,9 @@
 #ifndef FUSELINK_CHANNEL_H
 #define FUSELINK_CHANNEL_H
 
+#include <algorithm>
+#include <infiniband/verbs.h>
+#include "net.h"
 #include <thread>
 #include <condition_variable>
 #include <mutex>
@@ -8,6 +11,7 @@
 #include "task.h"
 #include "debug.h"
 #include "device.h"
+#include "net.h"
 
 #define N_CHANNELS 16
 #define MAX_PEERS 16
@@ -157,6 +161,18 @@ public:
     _general_task_fifo = fifo;
   }
 
+  int create_rdmaResources(struct ibv_device **dev_list, int dev_id);
+
+  struct ibv_mr* reg_mr(void* addr, size_t size, int access_flags) {
+    // Register memory region for RDMA
+    struct ibv_mr* mr = ibv_reg_mr(pd, addr, size, access_flags);
+    if (!mr) {
+      fprintf(stderr, "Failed to register memory region.\n");
+      return nullptr;
+    }
+    return mr;
+  }
+
   // Get number of processed tasks
   int getProcessedTasks() const {
     return _processed_tasks;
@@ -183,6 +199,10 @@ protected:
   int _total_tasks;      // Total number of tasks to process
   int _processed_tasks;  // Number of tasks processed so far
   int _finished_tasks;   // ..
+  ibv_context* ctx = nullptr; // RDMA context
+  ibv_pd* pd = nullptr; // Protection domain
+  ibv_cq* cq = nullptr; // Completion queue
+  ibv_qp* qp = nullptr; // Queue pair
   std::condition_variable _cv;
   std::mutex _mutex; // use cv and mutex to avoid infinite loop of cpu threads
 };
@@ -191,22 +211,28 @@ class SendChannel: public Channel {
 public:
   SendChannel();
   int checkSendingStatus();
+  int create_rdmaResources(struct ibv_device **dev_list, int dev_id);
+  int Connect(int port);
   virtual ~SendChannel() override;
   void threadMain() override;
   void threadMain_general() override;
 private:
   std::thread _thread;
+  struct IbSendComm _send_comm;
 };
 
 class RecvChannel: public Channel {
 public:
   RecvChannel();
+  int Connect(const char* peer_ip, int peer_port);
+  int create_rdmaResources(struct ibv_device **dev_list, int dev_id);
   virtual ~RecvChannel() override;
   void threadMain() override;
   void threadMain_general() override;
 
 private:
   std::thread _thread;
+  struct RemFifo _rem_fifo;
 };
 
 extern SendChannel* global_send_channels[MAX_PEERS][N_CHANNELS];
