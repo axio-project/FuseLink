@@ -6,7 +6,7 @@
 #include <sys/types.h>
 
 
-void IbTest(uint64_t *wr_ids, int num_tasks, int *mask, struct ibv_cq *cq) {
+void RoceTest(uint64_t *wr_ids, int num_tasks, int *mask, struct ibv_cq *cq) {
     int wrDone = 0;
     struct ibv_wc wcs[4];
     wrDone = ibv_poll_cq(cq, 4, wcs);
@@ -29,7 +29,23 @@ void IbTest(uint64_t *wr_ids, int num_tasks, int *mask, struct ibv_cq *cq) {
     }
 }
 
-void IbSend(void *buffer, size_t buffer_size, struct ibv_mr *mr, struct ibv_qp* qp, struct IbSendComm *sendComm, uint64_t wr_id) {
+void RoceCheckFinish(uint64_t *wr_ids, int *ntasks, struct ibv_cq *cq) {
+    int wrDone = 0;
+    struct ibv_wc wcs[8];
+    wrDone = ibv_poll_cq(cq, 8, wcs);
+
+    for (int w = 0; w < wrDone; w++) {
+        struct ibv_wc *wc = &wcs[w];
+        if (wc->status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "IBV_WC error: %s\n", ibv_wc_status_str(wc->status));
+            continue; // Skip this wc if there is an error
+        }
+        wr_ids[w] = wc->wr_id;
+    }
+    *ntasks = wrDone;
+}
+
+void RoceSend(void *buffer, size_t buffer_size, struct ibv_mr *mr, struct ibv_qp* qp, struct RoceSendComm *sendComm, uint64_t wr_id) {
     int slot = sendComm->fifoHead % MAX_REQUESTS;
     uint64_t idx = sendComm->fifoHead + 1;
     struct SendFifo *localElem = &sendComm->fifo[slot];
@@ -69,7 +85,7 @@ void IbSend(void *buffer, size_t buffer_size, struct ibv_mr *mr, struct ibv_qp* 
     sendComm->fifoHead++;
 }
 
-void IbRecv(void* buffer, size_t buffer_size, struct ibv_mr *mr, struct ibv_qp *qp, struct RemFifo* remFifo, uint64_t wr_id) {
+void RoceRecv(void* buffer, size_t buffer_size, struct ibv_mr *mr, struct ibv_qp *qp, struct RemFifo* remFifo, uint64_t wr_id) {
     struct ibv_send_wr wr = {};
     struct ibv_send_wr* bad_wr;
 

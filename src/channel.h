@@ -216,9 +216,12 @@ public:
   virtual ~SendChannel() override;
   void threadMain() override;
   void threadMain_general() override;
+  // post write to the remote host, with wr_id being task_id and imm_data being workload info
+  void postSend(GeneralTask &task, int task_id);
+  void checkFinish(size_t* finished_tasks, int* n);
 private:
   std::thread _thread;
-  struct IbSendComm _send_comm;
+  struct RoceSendComm _send_comm;
 };
 
 class RecvChannel: public Channel {
@@ -229,6 +232,9 @@ public:
   virtual ~RecvChannel() override;
   void threadMain() override;
   void threadMain_general() override;
+
+  // post receive for the receive host, with wr_id being task_id and fifo
+  void postRecvRequest(GeneralTask &task, int task_id);
 
 private:
   std::thread _thread;

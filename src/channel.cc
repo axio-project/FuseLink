@@ -606,12 +606,12 @@ void send_task_dispatcher_general(void* buffer, size_t sz, SendChannel* channels
   int sent_tasks = 0;
   int tail_cache[N_CHANNELS] = {0};
   std::vector<int> channel_pending_tasks[N_CHANNELS];
-  std::vector<SimulateTask> channel_pending_tasks_sim[N_CHANNELS];
 
   bool check_flag = false;
   for (int i = 0; i < nchunks;) {
     // find an available channel
     int target_channel_idx = i % n_channels;
+    // todo: select ring idx from recv msgs
     int target_ring_idx = (i / n_channels) % n_channels;
 
     NicRing* target_ring = rings[target_ring_idx];
@@ -652,15 +652,12 @@ void send_task_dispatcher_general(void* buffer, size_t sz, SendChannel* channels
           printf("channel %d: tail %lu, tail_cache %lu\n", i, tail, tail_cache[i]);
           for (int j = tail_cache[i]; j < tail; j++) {
             // post send on task j
-
-            // push to pending_tasks[i]
-            // printf("post send on task %d\n", j);
             // read target ring and slot
             int target_ring_idx = fifos[i].tasks[j % FIFO_SZ].ring_id;
             int target_ring_slot = fifos[i].tasks[j % FIFO_SZ].buffer_slot;
-            channel_pending_tasks_sim[i].push_back(SimulateTask(target_ring_idx, target_ring_slot));
+            channels[target_ring_idx]->postSend(fifos[i].tasks[j % FIFO_SZ], j);
+            channel_pending_tasks[i].push_back(j);
             sent_tasks++;
-            // todo select ring and post send
           }
           // update tail cache
           tail_cache[i] = tail;
@@ -671,17 +668,15 @@ void send_task_dispatcher_general(void* buffer, size_t sz, SendChannel* channels
       // mark finished
       // free the ring slot
       for (int i = 0; i < n_channels; i++) {
-        for (int j = 0; j < channel_pending_tasks_sim[i].size(); j++) {
-          auto& task = channel_pending_tasks_sim[i][j];
-          if (task.finished()) {
-            // mark finished
-            // free the ring slot
-            // printf("task finished deallocRingSlot: %d, %d\n", task.ring_id, task.slot);
-            deallocRingSlot(rings[task.ring_id], task.slot);
-            // remove this task from channel_pending_tasks_sim
-            pending_tasks--;
-            channel_pending_tasks_sim[i].erase(channel_pending_tasks_sim[i].begin() + j);
-          }
+        uint64_t finished_tasks[8];
+        int nfinished = 0;
+        channels[i]->checkFinish(finished_tasks, &nfinished);
+        for (int j = 0; j < nfinished; j++) {
+          // free the ring slot
+          auto finished_task_id = finished_tasks[j];
+          deallocRingSlot(rings[fifos[i].tasks[finished_task_id % FIFO_SZ].ring_id], fifos[i].tasks[finished_task_id % FIFO_SZ].buffer_slot);
+          channel_pending_tasks[i].erase(channel_pending_tasks[i].begin() + finished_task_id);
+          pending_tasks--;
         }
       }
       check_flag = false;
@@ -716,32 +711,35 @@ void send_task_dispatcher_general(void* buffer, size_t sz, SendChannel* channels
             }
           }
           auto& task = fifos[i].tasks[j % FIFO_SZ];
-          channel_pending_tasks_sim[i].push_back(SimulateTask(task.ring_id, task.buffer_slot));
+          channel_pending_tasks[i].push_back(j);
           sent_tasks++;
         }
-      }
+      } // tailcache < tail
       tail_cache[i] = tail;
     }
   }
 
   while (pending_tasks > 0) {
     for (int i = 0; i < n_channels; i++) {
-      if (channel_pending_tasks_sim[i].size() > 0) {
-        // check if any posted tasks has finished
-        for (int j = 0; j < channel_pending_tasks_sim[i].size(); j++) {
-          auto& task = channel_pending_tasks_sim[i][j];
-          if (task.finished()) {
-            // free the ring slot
-            // printf("task finished\n");
-            deallocRingSlot(rings[task.ring_id], task.slot);
-            pending_tasks--;
-            channel_pending_tasks_sim[i].erase(channel_pending_tasks_sim[i].begin() + j);
-          }
-        }
+      uint64_t finished_tasks[8];
+      int nfinished = 0;
+      channels[i]->checkFinish(finished_tasks, &nfinished);
+      for (int j = 0; j < nfinished; j++) {
+        deallocRingSlot(rings[fifos[i].tasks[finished_tasks[j] % FIFO_SZ].ring_id], fifos[i].tasks[finished_tasks[j] % FIFO_SZ].buffer_slot);
+        channel_pending_tasks[i].erase(channel_pending_tasks[i].begin() + finished_tasks[j]);
+        pending_tasks--;
       }
-    }
+    }// iterate through all channels
   }
 
+}
+
+void SendChannel::postSend(GeneralTask &task, int task_id) {
+  RoceSend(task.buffer, task.buffer_size, _send_comm.fifoMr, qp, &_send_comm, task_id);
+}
+
+void SendChannel::checkFinish(size_t* finished_tasks, int* n) {
+  RoceCheckFinish(finished_tasks, n, cq);
 }
 
 void recv_task_dispatcher(void* buffer, size_t sz, RecvChannel* channels[], void* rings[], int n_channels) {
