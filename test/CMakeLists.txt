@@ -28,6 +28,15 @@ add_executable(test_sendrecv_general
     ../device/device.cu
 )
 
+<<<<<<< Updated upstream
+=======
+add_executable(test_sendrecv_general
+    test_sendrecv_general.cu
+    ../src/channel.cc
+    ../device/device.cu
+)
+
+>>>>>>> Stashed changes
 # Set CUDA specific flags for all test executables
 set_target_properties(test_sendrecv test_sendrecv_general PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON

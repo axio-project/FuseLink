@@ -232,6 +232,31 @@ public:
   virtual ~RecvChannel() override;
   void threadMain() override;
   void threadMain_general() override;
+  GeneralTask* setTask_general(GeneralTask &task) {
+    std::unique_lock<std::mutex> lock(_mutex);
+    GeneralTask* result = nullptr;
+    int write_idx = _general_task_fifo->head;
+    // write to the head by CPU, read from the tail by GPU
+    int read_idx = _general_task_fifo->tail;
+    if (write_idx - read_idx < FIFO_SZ) {
+      const int idx = write_idx % FIFO_SZ;
+      _general_task_fifo->tasks[idx] = task;
+      __sync_synchronize();  // tasks must update before head
+      _general_task_fifo->head = write_idx + 1;
+      result = &_general_task_fifo->tasks[idx];
+      // execute the task
+      postRecvRequest(task, write_idx);
+    } else {
+      printf("General channel fifo is full\n");
+      lock.unlock();
+      return nullptr;
+    }
+    _total_tasks++;
+    _state = ChannelState::WORKING;
+    lock.unlock();
+    _cv.notify_one();
+    return result;
+  }
 
   // post receive for the receive host, with wr_id being task_id and fifo
   void postRecvRequest(GeneralTask &task, int task_id);
@@ -256,7 +281,7 @@ rings: pointer to the NIC rings array, same size as the channels
 
 void send_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], GpuTaskFifo fifos[], NicRing* rings[], int n_channels);
 void send_task_dispatcher_general(void* buffer, size_t sz, SendChannel* channels[], GeneralTaskFifo fifos[], NicRing* rings[], int n_channels, bool verify=false);
-void recv_task_dispatcher(void* buffer, size_t sz, RecvChannel* channels[], void* rings[], int n_channels);
+void recv_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], GeneralTaskFifo fifos[], NicRing* rings[], int n_channels, bool verify);
 // no need to deallocate channels, the channels will be released after the transmission finishes.
 
 #endif
