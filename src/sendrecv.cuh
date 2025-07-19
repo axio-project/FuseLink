@@ -18,6 +18,8 @@ __global__ void fuselink_send_kernel(void *buffer, size_t size, GpuMem *mem, Nic
 
 __global__ void fuselink_send_general_kernel(void *buffer, size_t size, GpuMem *mem, NicRing **ring, GeneralTaskFifo *fifos);
 
+__global__ void fuselink_recv_kernel(void *buffer, size_t size, GpuMem *mem, NicRing **ring, GeneralTaskFifo *fifos);
+
 int fuselink_recv(void* buffer, size_t size, cudaStream_t stream);
 
 #endif

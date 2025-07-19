@@ -747,12 +747,11 @@ void SendChannel::checkFinish(size_t* finished_tasks, int* n) {
 }
 
 void recv_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], GeneralTaskFifo fifos[], NicRing* rings[], int n_channels, bool verify) {
-  // TODO: implement
   const int batch_sz = 8;
   const int nchunks = CEIL_DIV(sz, FUSELINK_CHUNK_SZ);
 
   int pending_tasks = 0;
-  int sent_tasks = 0;
+  int recv_tasks = 0;
   int tail_cache[N_CHANNELS] = {0};
   std::vector<int> channel_pending_tasks[N_CHANNELS];
 
@@ -776,6 +775,7 @@ void recv_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], Gene
     // build general task and gpu task with the ring slot
     if (ring_slot >= 0) {
       GeneralTask general_task;
+      // receive buffer
       general_task.buffer = (void *)mem.device_ptr;
       size_t chunk_sz = i == nchunks - 1 ? sz - i * FUSELINK_CHUNK_SZ : FUSELINK_CHUNK_SZ;
       general_task.buffer_size = chunk_sz;
@@ -784,10 +784,11 @@ void recv_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], Gene
       general_task.stage = TASK_STAGE_COPY;
       general_task.chunk_id = i;
 
-      // set general task, pending for recv
-      channels[target_channel_idx]->setTask_general(general_task);
+      // post recv request and add this task to the pending list
+      channels[target_channel_idx]->postRecvRequest(general_task, i);
+      channel_pending_tasks[target_channel_idx].push_back(i);
 
-      // update i only if send a task
+      // update i only if post recv a task
       i++;
       pending_tasks++;
     }
@@ -795,50 +796,63 @@ void recv_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], Gene
     if (pending_tasks >= 96 || check_flag) {
       for (int i = 0; i < n_channels; i++) {
         // check all tasks in the channel
-        // auto tail = load_fifo_tail(fifos[i].tail_per_block, N_BLOCK_PER_FIFO);
+        for (int i = 0; i < n_channels; i++) {
+          uint64_t finished_tasks[8];
+          int nfinished = 0;
+          channels[i]->checkFinish(finished_tasks, &nfinished);
+          for (int j = 0; j < nfinished; j++) {
+            // free the ring slot
+            auto finished_task_id = finished_tasks[j];
+            // todo: fetch the task obj
+            channel_pending_tasks[i].erase(channel_pending_tasks[i].begin() + finished_task_id);
+            pending_tasks--;
+            // channel add task to fifo
+            channels[i]->setTask_general(fifos[i].tasks[/*finished_task_id % FIFO_SZ*/]);
+          }
+        }
+
         auto tail = load_volatile_host(&fifos[i].tail);
         if (tail > tail_cache[i]) {
           printf("channel %d: tail %lu, tail_cache %lu\n", i, tail, tail_cache[i]);
           for (int j = tail_cache[i]; j < tail; j++) {
-            // post send on task j
             // read target ring and slot
-            int target_ring_idx = fifos[i].tasks[j % FIFO_SZ].ring_id;
-            int target_ring_slot = fifos[i].tasks[j % FIFO_SZ].buffer_slot;
-            channels[target_ring_idx]->postSend(fifos[i].tasks[j % FIFO_SZ], j);
-            channel_pending_tasks[i].push_back(j);
-            sent_tasks++;
+            auto& task = fifos[i].tasks[j % FIFO_SZ];
+            // dealloc the ring slot
+            deallocRingSlot(rings[task.ring_id], task.buffer_slot);
+            recv_tasks++;
           }
           // update tail cache
           tail_cache[i] = tail;
         }
       }
-      // check if any posted tasks has finished
-      // channel[i]->checkSendingFinished();
-      // mark finished
-      // free the ring slot
-      for (int i = 0; i < n_channels; i++) {
-        uint64_t finished_tasks[8];
-        int nfinished = 0;
-        channels[i]->checkFinish(finished_tasks, &nfinished);
-        for (int j = 0; j < nfinished; j++) {
-          // free the ring slot
-          auto finished_task_id = finished_tasks[j];
-          deallocRingSlot(rings[fifos[i].tasks[finished_task_id % FIFO_SZ].ring_id], fifos[i].tasks[finished_task_id % FIFO_SZ].buffer_slot);
-          channel_pending_tasks[i].erase(channel_pending_tasks[i].begin() + finished_task_id);
-          pending_tasks--;
-        }
-      }
+      
       check_flag = false;
     } // check pending tasks has finished or not
     
   }// for all chunks
 
-  printf("sent %d tasks\n", sent_tasks);
+  printf("recv %d tasks\n", recv_tasks);
 
-  while (sent_tasks < nchunks) { // send remaining tasks
-    // check if any posted tasks has copy ready
+  while (recv_tasks < nchunks) { // send remaining tasks
+    // check if any posted recv request has finished
+
+    while (pending_tasks > 0) {
+      for (int i = 0; i < n_channels; i++) {
+        uint64_t finished_tasks[8];
+        int nfinished = 0;
+        channels[i]->checkFinish(finished_tasks, &nfinished);
+        for (int j = 0; j < nfinished; j++) {
+          // todo: fetch the task obj
+          // channel add task to fifo, wait for GPU to consume the received data
+          channels[i]->setTask_general(fifos[i].tasks[/*finished_task_id % FIFO_SZ*/]);
+          channel_pending_tasks[i].erase(channel_pending_tasks[i].begin() + finished_tasks[j]);
+          pending_tasks--;
+        }
+      }// iterate through all channels
+    }
+
+
     for (int i = 0; i < n_channels; i++) {
-      // auto tail = load_fifo_tail(fifos[i].tail_per_block, N_BLOCK_PER_FIFO);
       auto tail = load_volatile_host(&fifos[i].tail);
       printf("channel %d: now tail %lu\n", i, tail);
       if (tail > tail_cache[i]) {
@@ -847,38 +861,27 @@ void recv_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], Gene
           // check if any posted tasks has copy ready
           // mark finished
           // check data
-          if (verify) {
-            auto &task = fifos[i].tasks[j % FIFO_SZ];
-            uint64_t start_idx = task.chunk_id * FUSELINK_CHUNK_SZ / sizeof(uint32_t);
-            uint32_t* data = (uint32_t*)task.buffer;
-            printf("verify data at chunk id %d, start_idx %d\n", task.chunk_id, start_idx);
-            if (!verifyData(data, FUSELINK_CHUNK_SZ, start_idx)) {
-              printf("Data mismatch at index %d\n", j);
-              exit(1);
-            } else {
-              printf("Data verified at index %d\n", j);
-            }
-          }
+          // if (verify) {
+          //   auto &task = fifos[i].tasks[j % FIFO_SZ];
+          //   uint64_t start_idx = task.chunk_id * FUSELINK_CHUNK_SZ / sizeof(uint32_t);
+          //   uint32_t* data = (uint32_t*)task.buffer;
+          //   printf("verify data at chunk id %d, start_idx %d\n", task.chunk_id, start_idx);
+          //   if (!verifyData(data, FUSELINK_CHUNK_SZ, start_idx)) {
+          //     printf("Data mismatch at index %d\n", j);
+          //     exit(1);
+          //   } else {
+          //     printf("Data verified at index %d\n", j);
+          //   }
+          // }
           auto& task = fifos[i].tasks[j % FIFO_SZ];
-          channels[i]->postSend(task, j);
-          channel_pending_tasks[i].push_back(j);
-          sent_tasks++;
+          // erase the task from the pending list
+          channel_pending_tasks[i].erase(channel_pending_tasks[i].begin() + j);
+          recv_tasks++;
         }
       } // tailcache < tail
       tail_cache[i] = tail;
     }
   }
 
-  while (pending_tasks > 0) {
-    for (int i = 0; i < n_channels; i++) {
-      uint64_t finished_tasks[8];
-      int nfinished = 0;
-      channels[i]->checkFinish(finished_tasks, &nfinished);
-      for (int j = 0; j < nfinished; j++) {
-        deallocRingSlot(rings[fifos[i].tasks[finished_tasks[j] % FIFO_SZ].ring_id], fifos[i].tasks[finished_tasks[j] % FIFO_SZ].buffer_slot);
-        channel_pending_tasks[i].erase(channel_pending_tasks[i].begin() + finished_tasks[j]);
-        pending_tasks--;
-      }
-    }// iterate through all channels
-  }
+
 }

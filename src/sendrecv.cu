@@ -349,7 +349,170 @@ __global__ void fuselink_send_general_kernel(void *buffer, size_t size, GpuMem *
   }
 }
 
+__global__ void fuselink_recv_kernel(void *buffer, size_t size, GpuMem *mem, NicRing **ring, GeneralTaskFifo *fifos) {
+  // Step 1: Select channel using block index
+  const int channel_id = blockIdx.x;
+  const int block_y = blockIdx.y;
+  const int thread_id = threadIdx.x;
+  const int thread_id_in_channel = thread_id + blockDim.x * block_y;
+  
+  const int my_fifo = channel_id;
+
+  uint64_t read_idx = 0;
+  uint64_t write_idx = 0;
+
+  GeneralTaskFifo* fifo = &fifos[my_fifo];
+
+  // write to the buffer
+  int ntasks = CEIL_DIV(size, FUSELINK_CHUNK_SZ);
+
+  // calculate the number of tasks for this block
+  int ntasks_my_block = ntasks / N_CHANNELS;
+  
+  if (channel_id < ntasks % N_CHANNELS) {
+    ntasks_my_block++;
+  }
+
+  // calculate the start address, in bytes
+  size_t offset = my_fifo * FUSELINK_CHUNK_SZ;
+  size_t channel_step_sz = FUSELINK_CHUNK_SZ * N_CHANNELS / sizeof(uint32_t);
+  // task size in bytes
+  size_t task_size = FUSELINK_CHUNK_SZ;
+
+  size_t thread_step_size = gridDim.y * blockDim.x; // each thread copy a uint32_t at a time
+  size_t nsteps_per_thread = CEIL_DIV(task_size, thread_step_size * sizeof(uint32_t));
+  uint32_t *slot_dst_addr = (uint32_t *) ((uintptr_t)buffer + offset);
+  
+  for (size_t i = 0; i < ntasks_my_block; i++) {
+    // Step 2: Post recv and record task id (handled by CPU thread)
+    // Step 3: Check task finish status
+    write_idx = ld_volatile_device(&fifo->head);
+    
+    for (auto t = read_idx; t < write_idx; t++) {
+      auto& task = fifo->tasks[t % FIFO_SZ];
+      
+      // Step 4: If finished, add to fifo
+      if (task.stage == TASK_STAGE_RECEIVED) {
+        uint32_t *cur_src_addr = (uint32_t *) ((uintptr_t)task.buffer);
+        uint32_t *cur_dst_addr = slot_dst_addr;
+
+        // copy the task from the buffer to destination
+        #pragma unroll
+        for (size_t j = 0; j < nsteps_per_thread; j++) {
+          cur_dst_addr[thread_id_in_channel] = cur_src_addr[thread_id_in_channel];
+          cur_src_addr += thread_step_size;
+          cur_dst_addr += thread_step_size;
+        }
+        
+        // Step 5: Check if GPU has consumed the data, if so, free the buffer slot
+        if (thread_id == 0) {
+          task.stage = TASK_STAGE_FINISH;
+          __threadfence_block();
+        }
+        
+        slot_dst_addr += channel_step_sz;
+        __syncthreads();
+      }
+    }
+    __threadfence_block();
+    if (thread_id == 0 && write_idx > read_idx) {
+      fifo->tail = write_idx;
+    }
+    read_idx = write_idx;
+  }
+}
+
 int fuselink_recv(void* buffer, size_t size, cudaStream_t stream) {
+  // check if buffer on gpu
+  CUdeviceptr d_ptr = (CUdeviceptr)buffer;
+  CUcontext ctx = 0;
+  CUresult res = cuPointerGetAttribute(&ctx, CU_POINTER_ATTRIBUTE_CONTEXT, d_ptr);
+  FUSELINK_CHECK_CUDA_ERR(res, "pointer not on gpu");
+  
+  // partition buffer into chunks
+  size_t n_chunks = CEIL_DIV(size, FUSELINK_CHUNK_SZ);
+
+  // allocate channels
+  RecvChannel *chs[N_CHANNELS];
+
+  // TODO: allocate channels
+  // allocate_channels(peer_id, N_CHANNELS, (void**)chs, CHANNEL_TYPE_RECV);
+  for (size_t i = 0; i < N_CHANNELS; i++) {
+    chs[i] = new RecvChannel();
+  }
+
+  // calculate the number of tasks for each channel
+  int ntasks[N_CHANNELS];
+  for (size_t i = 0; i < N_CHANNELS; i++) {
+    ntasks[i] = FLOOR_DIV(n_chunks, N_CHANNELS);
+    if (i < n_chunks % N_CHANNELS) {
+      ntasks[i]++;
+    }
+  }
+  printf("ntasks: ");
+  for (size_t i = 0; i < N_CHANNELS; i++) {
+    printf("%d ", ntasks[i]);
+  }
+  printf("\n");
+
+  // allocate GpuTaskFifo* fifos in unified memory, freed in the end
+  GeneralTaskFifo *fifos;
+  CUDA_CHECK(cudaMallocHost(&fifos, N_CHANNELS * sizeof(GeneralTaskFifo), cudaHostAllocMapped));
+  CUDA_CHECK(cudaMemset(fifos, 0, N_CHANNELS * sizeof(GeneralTaskFifo)));
+
+  for (uint i = 0; i < N_CHANNELS; i++) {
+    chs[i]->setGeneralTaskFifo(&fifos[i]);
+  }
+  
+  // count GPU nums
+  int nGpus = 0;
+  CUDA_CHECK(cudaGetDeviceCount(&nGpus));
+  
+  // build rings, to be freed in the end
+  NicRing* rings[N_CHANNELS];
+  for (size_t i = 0; i < N_CHANNELS; i++) {
+    rings[i] = new NicRing();
+    initNicRing(rings[i], 0);
+  }
+
+  // setup task dispatcher thread
+  int nchannels = N_CHANNELS;
+  std::thread recv_task_dispatcher_thread(&recv_task_dispatcher, buffer, size, chs, fifos, rings, nchannels, false);
+
+  // run kernel
+  int threads_per_block = 1024;
+  dim3 grid_dim(N_CHANNELS, N_BLOCK_PER_FIFO);
+  cudaEvent_t start, end;
+  CUDA_CHECK(cudaEventCreate(&start));
+  CUDA_CHECK(cudaEventCreate(&end));
+  cudaEventRecord(start, stream);
+  
+  fuselink_recv_kernel<<<grid_dim, threads_per_block, 0, stream>>>(buffer, size, NULL, NULL, fifos);
+  CUDA_CHECK(cudaEventRecord(end, stream));
+  CUDA_CHECK(cudaEventSynchronize(end));
+  float elapsed_time;
+  CUDA_CHECK(cudaEventElapsedTime(&elapsed_time, start, end));
+  printf("recv time: %f ms\n", elapsed_time);
+  CUDA_CHECK(cudaEventDestroy(start));
+  CUDA_CHECK(cudaEventDestroy(end));
+  
+  // join cpu thread
+  recv_task_dispatcher_thread.join();
+  printf("recv task dispatcher thread joined\n");
+  
+  // free channels
+  for (size_t i = 0; i < N_CHANNELS; i++) {
+    delete chs[i];
+  }
+
+  // free rings
+  for (size_t i = 0; i < N_CHANNELS; i++) {
+    freeNicRing(rings[i]);
+    delete rings[i];
+  }
+
+  CUDA_CHECK(cudaFreeHost(fifos));
+
   return 0;
 }
 

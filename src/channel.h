@@ -244,8 +244,7 @@ public:
       __sync_synchronize();  // tasks must update before head
       _general_task_fifo->head = write_idx + 1;
       result = &_general_task_fifo->tasks[idx];
-      // execute the task
-      postRecvRequest(task, write_idx);
+      // wait for GPU to fetch the data to the final destination
     } else {
       printf("General channel fifo is full\n");
       lock.unlock();
