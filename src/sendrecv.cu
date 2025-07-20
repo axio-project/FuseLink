@@ -129,8 +129,12 @@ int fuselink_send_general(void* buffer, size_t size, cudaStream_t stream, int pe
   CUresult res = cuPointerGetAttribute(&ctx, CU_POINTER_ATTRIBUTE_CONTEXT, d_ptr);
   FUSELINK_CHECK_CUDA_ERR(res, "pointer not on gpu");
   
+  printf("[DEBUG] fuselink_send_general: buffer=%p, size=%zu, peer_id=%d, verify=%d\n", 
+         buffer, size, peer_id, verify);
+  
   // partition buffer into chunks
   size_t n_chunks = CEIL_DIV(size, FUSELINK_CHUNK_SZ);
+  printf("[DEBUG] fuselink_send_general: n_chunks=%zu, chunk_size=%d\n", n_chunks, FUSELINK_CHUNK_SZ);
 
   // allocate channels
   SendChannel *chs[N_CHANNELS];
@@ -140,6 +144,7 @@ int fuselink_send_general(void* buffer, size_t size, cudaStream_t stream, int pe
   for (size_t i = 0; i < N_CHANNELS; i++) {
     chs[i] = new SendChannel();
   }
+  printf("[DEBUG] fuselink_send_general: allocated %d send channels\n", N_CHANNELS);
 
   // calculate the number of tasks for each channel
   int ntasks[N_CHANNELS];
@@ -149,7 +154,7 @@ int fuselink_send_general(void* buffer, size_t size, cudaStream_t stream, int pe
       ntasks[i]++;
     }
   }
-  printf("ntasks: ");
+  printf("[DEBUG] fuselink_send_general: ntasks per channel: ");
   for (size_t i = 0; i < N_CHANNELS; i++) {
     printf("%d ", ntasks[i]);
   }
@@ -160,6 +165,7 @@ int fuselink_send_general(void* buffer, size_t size, cudaStream_t stream, int pe
   // CUDA_CHECK(cudaMallocManaged(&fifos, N_CHANNELS * sizeof(GeneralTaskFifo)));
   CUDA_CHECK(cudaMallocHost(&fifos, N_CHANNELS * sizeof(GeneralTaskFifo), cudaHostAllocMapped));
   CUDA_CHECK(cudaMemset(fifos, 0, N_CHANNELS * sizeof(GeneralTaskFifo)));
+  printf("[DEBUG] fuselink_send_general: allocated fifos at %p\n", fifos);
 
   for (uint i = 0; i < N_CHANNELS; i++) {
     chs[i]->setGeneralTaskFifo(&fifos[i]);
@@ -174,14 +180,18 @@ int fuselink_send_general(void* buffer, size_t size, cudaStream_t stream, int pe
     rings[i] = new NicRing();
     initNicRing(rings[i], 0);
   }
+  printf("[DEBUG] fuselink_send_general: initialized %d NIC rings\n", N_CHANNELS);
 
   // setup task dispatcher thread
   int nchannels = N_CHANNELS;
+  printf("[DEBUG] fuselink_send_general: starting send_task_dispatcher_general\n");
   std::thread general_task_dispatcher_thread(&send_task_dispatcher_general, buffer, size, chs, fifos, rings, nchannels, verify);
 
   // run kernel
   int threads_per_block = 1024;
   dim3 grid_dim(N_CHANNELS, N_BLOCK_PER_FIFO);
+  printf("[DEBUG] fuselink_send_general: launching kernel with grid_dim=(%d,%d,%d), block_dim=%d\n", 
+         grid_dim.x, grid_dim.y, grid_dim.z, threads_per_block);
   cudaEvent_t start, end;
   CUDA_CHECK(cudaEventCreate(&start));
   CUDA_CHECK(cudaEventCreate(&end));
@@ -192,13 +202,13 @@ int fuselink_send_general(void* buffer, size_t size, cudaStream_t stream, int pe
   CUDA_CHECK(cudaEventSynchronize(end));
   float elapsed_time;
   CUDA_CHECK(cudaEventElapsedTime(&elapsed_time, start, end));
-  printf("copy time: %f ms\n", elapsed_time);
+  printf("[DEBUG] fuselink_send_general: kernel execution time: %f ms\n", elapsed_time);
   CUDA_CHECK(cudaEventDestroy(start));
   CUDA_CHECK(cudaEventDestroy(end));
   
   // join cpu thread
   general_task_dispatcher_thread.join();
-  printf("task dispatcher thread joined\n");
+  printf("[DEBUG] fuselink_send_general: task dispatcher thread joined\n");
   
   // free channels
   for (size_t i = 0; i < N_CHANNELS; i++) {
@@ -212,6 +222,7 @@ int fuselink_send_general(void* buffer, size_t size, cudaStream_t stream, int pe
   }
 
   CUDA_CHECK(cudaFreeHost(fifos));
+  printf("[DEBUG] fuselink_send_general: cleanup completed\n");
 
   return 0;
 }
@@ -429,8 +440,11 @@ int fuselink_recv(void* buffer, size_t size, cudaStream_t stream) {
   CUresult res = cuPointerGetAttribute(&ctx, CU_POINTER_ATTRIBUTE_CONTEXT, d_ptr);
   FUSELINK_CHECK_CUDA_ERR(res, "pointer not on gpu");
   
+  printf("[DEBUG] fuselink_recv: buffer=%p, size=%zu\n", buffer, size);
+  
   // partition buffer into chunks
   size_t n_chunks = CEIL_DIV(size, FUSELINK_CHUNK_SZ);
+  printf("[DEBUG] fuselink_recv: n_chunks=%zu, chunk_size=%d\n", n_chunks, FUSELINK_CHUNK_SZ);
 
   // allocate channels
   RecvChannel *chs[N_CHANNELS];
@@ -440,6 +454,7 @@ int fuselink_recv(void* buffer, size_t size, cudaStream_t stream) {
   for (size_t i = 0; i < N_CHANNELS; i++) {
     chs[i] = new RecvChannel();
   }
+  printf("[DEBUG] fuselink_recv: allocated %d recv channels\n", N_CHANNELS);
 
   // calculate the number of tasks for each channel
   int ntasks[N_CHANNELS];
@@ -449,7 +464,7 @@ int fuselink_recv(void* buffer, size_t size, cudaStream_t stream) {
       ntasks[i]++;
     }
   }
-  printf("ntasks: ");
+  printf("[DEBUG] fuselink_recv: ntasks per channel: ");
   for (size_t i = 0; i < N_CHANNELS; i++) {
     printf("%d ", ntasks[i]);
   }
@@ -459,6 +474,7 @@ int fuselink_recv(void* buffer, size_t size, cudaStream_t stream) {
   GeneralTaskFifo *fifos;
   CUDA_CHECK(cudaMallocHost(&fifos, N_CHANNELS * sizeof(GeneralTaskFifo), cudaHostAllocMapped));
   CUDA_CHECK(cudaMemset(fifos, 0, N_CHANNELS * sizeof(GeneralTaskFifo)));
+  printf("[DEBUG] fuselink_recv: allocated fifos at %p\n", fifos);
 
   for (uint i = 0; i < N_CHANNELS; i++) {
     chs[i]->setGeneralTaskFifo(&fifos[i]);
@@ -474,14 +490,18 @@ int fuselink_recv(void* buffer, size_t size, cudaStream_t stream) {
     rings[i] = new NicRing();
     initNicRing(rings[i], 0);
   }
+  printf("[DEBUG] fuselink_recv: initialized %d NIC rings\n", N_CHANNELS);
 
   // setup task dispatcher thread
   int nchannels = N_CHANNELS;
+  printf("[DEBUG] fuselink_recv: starting recv_task_dispatcher\n");
   std::thread recv_task_dispatcher_thread(&recv_task_dispatcher, buffer, size, chs, fifos, rings, nchannels, false);
 
   // run kernel
   int threads_per_block = 1024;
   dim3 grid_dim(N_CHANNELS, N_BLOCK_PER_FIFO);
+  printf("[DEBUG] fuselink_recv: launching kernel with grid_dim=(%d,%d,%d), block_dim=%d\n", 
+         grid_dim.x, grid_dim.y, grid_dim.z, threads_per_block);
   cudaEvent_t start, end;
   CUDA_CHECK(cudaEventCreate(&start));
   CUDA_CHECK(cudaEventCreate(&end));
@@ -492,13 +512,13 @@ int fuselink_recv(void* buffer, size_t size, cudaStream_t stream) {
   CUDA_CHECK(cudaEventSynchronize(end));
   float elapsed_time;
   CUDA_CHECK(cudaEventElapsedTime(&elapsed_time, start, end));
-  printf("recv time: %f ms\n", elapsed_time);
+  printf("[DEBUG] fuselink_recv: kernel execution time: %f ms\n", elapsed_time);
   CUDA_CHECK(cudaEventDestroy(start));
   CUDA_CHECK(cudaEventDestroy(end));
   
   // join cpu thread
   recv_task_dispatcher_thread.join();
-  printf("recv task dispatcher thread joined\n");
+  printf("[DEBUG] fuselink_recv: task dispatcher thread joined\n");
   
   // free channels
   for (size_t i = 0; i < N_CHANNELS; i++) {
@@ -512,6 +532,7 @@ int fuselink_recv(void* buffer, size_t size, cudaStream_t stream) {
   }
 
   CUDA_CHECK(cudaFreeHost(fifos));
+  printf("[DEBUG] fuselink_recv: cleanup completed\n");
 
   return 0;
 }

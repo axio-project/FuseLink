@@ -22,4 +22,6 @@ __global__ void fuselink_recv_kernel(void *buffer, size_t size, GpuMem *mem, Nic
 
 int fuselink_recv(void* buffer, size_t size, cudaStream_t stream);
 
+int fuselink_init(char *remote_ip, int remote_port);
+
 #endif

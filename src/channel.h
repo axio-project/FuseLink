@@ -259,6 +259,7 @@ public:
 
   // post receive for the receive host, with wr_id being task_id and fifo
   void postRecvRequest(GeneralTask &task, int task_id);
+  void checkFinish(size_t* finished_tasks, int* n);
 
 private:
   std::thread _thread;
@@ -268,6 +269,7 @@ private:
 extern SendChannel* global_send_channels[MAX_PEERS][N_CHANNELS];
 extern RecvChannel* global_recv_channels[MAX_PEERS][N_CHANNELS];
 
+void init_channels(int my_id, int n_peers, int n_channels);
 void allocate_channels(int peer_id, int n_channels, void** channel_array, int channel_type);
 
 /*
