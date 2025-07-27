@@ -18,24 +18,6 @@ SendChannel* global_send_channels[MAX_PEERS][N_CHANNELS] = {nullptr};
 RecvChannel* global_recv_channels[MAX_PEERS][N_CHANNELS] = {nullptr};
 
 
-class SimulateTask {
-public:
-  SimulateTask(int ring_id, int slot) {
-    start_time = std::chrono::high_resolution_clock::now();
-    this->ring_id = ring_id;
-    this->slot = slot;
-  }
-
-  bool finished() {
-    return true;
-    // return std::chrono::high_resolution_clock::now() - start_time > std::chrono::milliseconds(1);
-  }
-
-  int ring_id;
-  std::chrono::time_point<std::chrono::high_resolution_clock> start_time;
-  int slot;
-};
-
 inline uint64_t load_volatile_host(uint64_t volatile* ptr) {
   uint64_t ans;
   asm volatile("movq %1, %0" : "=r"(ans) : "m"(*ptr) : "memory");
@@ -695,7 +677,7 @@ void send_task_dispatcher_general(void* buffer, size_t sz, SendChannel* channels
           auto finished_task_id = finished_tasks[j];
           printf("[DEBUG] send_task_dispatcher_general: freeing ring slot for finished task %lu\n", finished_task_id);
           deallocRingSlot(rings[fifos[i].tasks[finished_task_id % FIFO_SZ].ring_id], fifos[i].tasks[finished_task_id % FIFO_SZ].buffer_slot);
-          auto it = std::find(channel_pending_tasks[i].begin(), channel_pending_tasks[i].end(), fifos[i].tasks[finished_task_id % FIFO_SZ]);
+          auto it = std::find(channel_pending_tasks[i].begin(), channel_pending_tasks[i].end(), fifos[i].tasks[finished_task_id % FIFO_SZ].chunk_id);
           if (it != channel_pending_tasks[i].end()) {
             channel_pending_tasks[i].erase(it);
           } else {
@@ -777,7 +759,7 @@ void SendChannel::checkFinish(size_t* finished_tasks, int* n) {
   RoceCheckFinish(finished_tasks, n, cq);
 }
 
-void recv_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], GeneralTaskFifo fifos[], NicRing* rings[], int n_channels, bool verify) {
+void recv_task_dispatcher(void* buffer, size_t sz, RecvChannel* channels[], GeneralTaskFifo fifos[], NicRing* rings[], int n_channels, bool verify) {
   printf("[DEBUG] recv_task_dispatcher: buffer=%p, size=%zu, n_channels=%d, verify=%d\n", 
          buffer, sz, n_channels, verify);
   const int batch_sz = 8;
@@ -833,9 +815,10 @@ void recv_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], Gene
              general_task.chunk_id, general_task.buffer, general_task.buffer_size, general_task.ring_id, general_task.buffer_slot);
 
       // post recv request and add this task to the pending list
-      printf("[DEBUG] recv_task_dispatcher: posting recv request for task %d\n", i);
+      printf("[DEBUG] recv_task_dispatcher: posting recv request for task %d, channel %d\n", i, target_channel_idx);
       // post recv task to target_channel
       channels[target_channel_idx]->postRecvRequest(general_task, i);
+      printf("[DEBUG] call postRecvRequest\n");
       channel_pending_tasks[target_channel_idx].push_back(general_task);
 
       // update i only if post recv a task
@@ -902,7 +885,7 @@ void recv_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], Gene
   printf("[DEBUG] recv_task_dispatcher: recv %d tasks\n", recv_tasks);
 
   while (recv_tasks < nchunks) { // recv remaining tasks
-    printf("[DEBUG] recv_task_dispatcher: waiting for remaining %d tasks\n", nchunks - recv_tasks);
+    // printf("[DEBUG] recv_task_dispatcher: waiting for remaining %d tasks\n", nchunks - recv_tasks);
     // check if any posted recv request has finished
 
     while (pending_tasks > 0) {
@@ -913,10 +896,11 @@ void recv_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], Gene
         GeneralTask finished_task;
         channels[i]->checkFinish(finished_tasks, &nfinished);
         for (int j = 0; j < nfinished; j++) {
-          printf("[DEBUG] recv_task_dispatcher: recv finished for remaining task %lu\n", finished_tasks[j]);
+          // printf("[DEBUG] recv_task_dispatcher: recv finished for remaining task %lu\n", finished_tasks[j]);
           // find the it with chunk_id == finished_task_id
-          auto it = std::find_if(channel_pending_tasks[i].begin(), channel_pending_tasks[i].end(), [finished_tasks[j]](const GeneralTask& task) {
-            return task.chunk_id == finished_tasks[j];
+          int expected_chunk_id = static_cast<int>(finished_tasks[j]);
+          auto it = std::find_if(channel_pending_tasks[i].begin(), channel_pending_tasks[i].end(), [expected_chunk_id](const GeneralTask& task) {
+            return task.chunk_id == expected_chunk_id;
           });
           if (it != channel_pending_tasks[i].end()) {
             finished_task = *it;
@@ -934,7 +918,7 @@ void recv_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], Gene
 
     for (int i = 0; i < n_channels; i++) {
       auto tail = load_volatile_host(&fifos[i].tail);
-      printf("[DEBUG] recv_task_dispatcher: channel %d: now tail %lu\n", i, tail);
+      // printf("[DEBUG] recv_task_dispatcher: channel %d: now tail %lu\n", i, tail);
       if (tail > tail_cache[i]) { // new consumed data chunk
         printf("[DEBUG] recv_task_dispatcher: channel %d: tail %lu, tail_cache %lu\n", i, tail, tail_cache[i]);
         for (int j = tail_cache[i]; j < tail; j++) {
@@ -951,40 +935,58 @@ void recv_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], Gene
 }
 
 void RecvChannel::postRecvRequest(GeneralTask &task, int task_id) {
-  RoceRecv(task.buffer, task.buffer_size, _rem_fifo.mr, qp, &_rem_fifo, task_id);
+  printf("[DEBUG] simulate recv request\n");
+  _simulate_tasks.push(SimulateTask(task.ring_id, task.buffer_slot, task.chunk_id));
+  // RoceRecv(task.buffer, task.buffer_size, _rem_fifo.mr, qp, &_rem_fifo, task_id);
 }
 
 void RecvChannel::checkFinish(size_t* finished_tasks, int* n) {
-  RoceCheckFinish(finished_tasks, n, cq);
+  *n = 0;
+  if (_simulate_tasks.empty()) {
+    *n = 0;
+    return;
+  }
+  SimulateTask task = _simulate_tasks.front();
+  while (task.finished()) {
+    // get task chunk id
+    finished_tasks[*n] = task.chunk_id;
+    *n += 1;
+    _simulate_tasks.pop();
+    if (_simulate_tasks.empty() || *n >= 8) {
+      break;
+    }
+    task = _simulate_tasks.front();
+  }
+  // RoceCheckFinish(finished_tasks, n, cq);
 }
 
 void init_channels(int my_id, int n_peers, int n_channels) {
-  struct ibv_device **dev_list;
-  dev_list = ibv_get_device_list(NULL);
-  if (!dev_list) {
-    fprintf(stderr, "Failed to get RDMA devices.\n");
-    exit(1);
-  }
-  for (int i = 0; i < n_peers; i++) {
-    if (i == my_id) continue;
-    for (int j = 0; j < n_channels; j++) {
-      SendChannel* send_channel = new SendChannel();
-      RecvChannel* recv_channel = new RecvChannel();
+  // struct ibv_device **dev_list;
+  // dev_list = ibv_get_device_list(NULL);
+  // if (!dev_list) {
+  //   fprintf(stderr, "Failed to get RDMA devices.\n");
+  //   exit(1);
+  // }
+  // for (int i = 0; i < n_peers; i++) {
+  //   if (i == my_id) continue;
+  //   for (int j = 0; j < n_channels; j++) {
+  //     SendChannel* send_channel = new SendChannel();
+  //     RecvChannel* recv_channel = new RecvChannel();
 
-      send_channel->create_rdmaResources(dev_list, j);
-      recv_channel->create_rdmaResources(dev_list, j);
-      // init socket
-      if (my_id >= i) {
-        send_channel->Connect(BASE_PORT + my_id + i);
-        recv_channel->Connect(ips[i], BASE_PORT + my_id + i);
-      } else {
-        recv_channel->Connect(ips[i], BASE_PORT + my_id + i);
-        send_channel->Connect(BASE_PORT + my_id + i);
-      }
-      global_send_channels[i][j] = send_channel;
-      global_recv_channels[i][j] = recv_channel;
-    } // for all channels
-  } // for all peers
+  //     send_channel->create_rdmaResources(dev_list, j);
+  //     recv_channel->create_rdmaResources(dev_list, j);
+  //     // init socket
+  //     if (my_id >= i) {
+  //       send_channel->Connect(BASE_PORT + my_id + i);
+  //       recv_channel->Connect(ips[i], BASE_PORT + my_id + i);
+  //     } else {
+  //       recv_channel->Connect(ips[i], BASE_PORT + my_id + i);
+  //       send_channel->Connect(BASE_PORT + my_id + i);
+  //     }
+  //     global_send_channels[i][j] = send_channel;
+  //     global_recv_channels[i][j] = recv_channel;
+  //   } // for all channels
+  // } // for all peers
 
-  ibv_free_device_list(dev_list);
+  // ibv_free_device_list(dev_list);
 }

@@ -7,9 +7,7 @@
 #include <cuda_runtime.h>
 #include "task.h"
 
-#define FUSELINK_CHUNK_SZ (1 << 21) // 2MB
-#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
-#define FLOOR_DIV(a, b) ((a) / (b))
+#include "common.h"
 
 int fuselink_send(void* buffer, size_t size, cudaStream_t stream, int peer_id);
 int fuselink_send_general(void* buffer, size_t size, cudaStream_t stream, int peer_id, bool verify=false);

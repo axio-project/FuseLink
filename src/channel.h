@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <cuda_runtime.h>
+#include <queue>
 #include "task.h"
 #include "debug.h"
 #include "device.h"
@@ -242,6 +243,7 @@ public:
       const int idx = write_idx % FIFO_SZ;
       _general_task_fifo->tasks[idx] = task;
       __sync_synchronize();  // tasks must update before head
+      printf("producer write_idx %d, read_idx %d\n", write_idx, read_idx);
       _general_task_fifo->head = write_idx + 1;
       result = &_general_task_fifo->tasks[idx];
       // wait for GPU to fetch the data to the final destination
@@ -264,6 +266,7 @@ public:
 private:
   std::thread _thread;
   struct RemFifo _rem_fifo;
+  std::queue<SimulateTask> _simulate_tasks;
 };
 
 extern SendChannel* global_send_channels[MAX_PEERS][N_CHANNELS];
@@ -282,7 +285,7 @@ rings: pointer to the NIC rings array, same size as the channels
 
 void send_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], GpuTaskFifo fifos[], NicRing* rings[], int n_channels);
 void send_task_dispatcher_general(void* buffer, size_t sz, SendChannel* channels[], GeneralTaskFifo fifos[], NicRing* rings[], int n_channels, bool verify=false);
-void recv_task_dispatcher(void* buffer, size_t sz, SendChannel* channels[], GeneralTaskFifo fifos[], NicRing* rings[], int n_channels, bool verify);
+void recv_task_dispatcher(void* buffer, size_t sz, RecvChannel* channels[], GeneralTaskFifo fifos[], NicRing* rings[], int n_channels, bool verify);
 // no need to deallocate channels, the channels will be released after the transmission finishes.
 
 #endif

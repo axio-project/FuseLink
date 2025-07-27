@@ -2,6 +2,7 @@
 #include <cuda.h>
 #include "checks.h"
 #include "channel.h"
+#include "debug.h"
 
 __device__ __forceinline__ uint64_t ld_volatile_device(uint64_t* ptr) {
   uint64_t ans;
@@ -329,11 +330,7 @@ __global__ void fuselink_send_general_kernel(void *buffer, size_t size, GpuMem *
   // printf("thread_step_size %lu, nsteps_per_thread %lu fifo %d, slot_src_addr %p buffer %p\n", thread_step_size, nsteps_per_thread, my_fifo, slot_src_addr, buffer);
   for (size_t i = 0; i < ntasks_my_block;/*update i in function only after successfull*/) {
     // wait for available task slot
-    // if (thread_id == 0) {
     write_idx = ld_volatile_device(&fifo->head);
-      // printf("i %d, write_idx %lu\n", i, write_idx);
-    // }
-    // __syncthreads();
     for (auto t = read_idx; t < write_idx; t++) {
       auto& task = fifo->tasks[t % FIFO_SZ];
       uint32_t *cur_dst_addr = (uint32_t *) ((uintptr_t)task.buffer);
@@ -368,7 +365,7 @@ __global__ void fuselink_recv_kernel(void *buffer, size_t size, GpuMem *mem, Nic
   const int thread_id_in_channel = thread_id + blockDim.x * block_y;
   
   const int my_fifo = channel_id;
-
+  
   uint64_t read_idx = 0;
   uint64_t write_idx = 0;
 
@@ -394,36 +391,30 @@ __global__ void fuselink_recv_kernel(void *buffer, size_t size, GpuMem *mem, Nic
   size_t nsteps_per_thread = CEIL_DIV(task_size, thread_step_size * sizeof(uint32_t));
   uint32_t *slot_dst_addr = (uint32_t *) ((uintptr_t)buffer + offset);
   
-  for (size_t i = 0; i < ntasks_my_block; i++) {
+  for (size_t i = 0; i < ntasks_my_block; /*update i in function only after successfull*/) {
     // Step 2: Post recv and record task id (handled by CPU thread)
     // Step 3: Check task finish status
     write_idx = ld_volatile_device(&fifo->head);
-    
+    // printf("read_idx %lu, write_idx %lu\n", read_idx, write_idx);
     for (auto t = read_idx; t < write_idx; t++) {
+      // printf("read_idx %lu, write_idx %lu\n", read_idx, write_idx);
       auto& task = fifo->tasks[t % FIFO_SZ];
       
       // Step 4: If finished, add to fifo
-      if (task.stage == TASK_STAGE_RECEIVED) {
-        uint32_t *cur_src_addr = (uint32_t *) ((uintptr_t)task.buffer);
-        uint32_t *cur_dst_addr = slot_dst_addr;
+      uint32_t *cur_src_addr = (uint32_t *) ((uintptr_t)task.buffer);
+      uint32_t *cur_dst_addr = slot_dst_addr;
 
-        // copy the task from the buffer to destination
-        #pragma unroll
-        for (size_t j = 0; j < nsteps_per_thread; j++) {
-          cur_dst_addr[thread_id_in_channel] = cur_src_addr[thread_id_in_channel];
-          cur_src_addr += thread_step_size;
-          cur_dst_addr += thread_step_size;
-        }
-        
-        // Step 5: Check if GPU has consumed the data, if so, free the buffer slot
-        if (thread_id == 0) {
-          task.stage = TASK_STAGE_FINISH;
-          __threadfence_block();
-        }
-        
-        slot_dst_addr += channel_step_sz;
-        __syncthreads();
+      // copy the task from the buffer to destination
+      #pragma unroll
+      for (size_t j = 0; j < nsteps_per_thread; j++) {
+        cur_dst_addr[thread_id_in_channel] = cur_src_addr[thread_id_in_channel];
+        cur_src_addr += thread_step_size;
+        cur_dst_addr += thread_step_size;
       }
+      i++;
+      slot_dst_addr += channel_step_sz;
+      __syncthreads();
+
     }
     __threadfence_block();
     if (thread_id == 0 && write_idx > read_idx) {
@@ -495,7 +486,8 @@ int fuselink_recv(void* buffer, size_t size, cudaStream_t stream) {
   // setup task dispatcher thread
   int nchannels = N_CHANNELS;
   printf("[DEBUG] fuselink_recv: starting recv_task_dispatcher\n");
-  std::thread recv_task_dispatcher_thread(&recv_task_dispatcher, buffer, size, chs, fifos, rings, nchannels, false);
+  bool verify = false;
+  std::thread recv_task_dispatcher_thread(&recv_task_dispatcher, buffer, size, chs, fifos, rings, nchannels, verify);
 
   // run kernel
   int threads_per_block = 1024;
@@ -505,7 +497,7 @@ int fuselink_recv(void* buffer, size_t size, cudaStream_t stream) {
   cudaEvent_t start, end;
   CUDA_CHECK(cudaEventCreate(&start));
   CUDA_CHECK(cudaEventCreate(&end));
-  cudaEventRecord(start, stream);
+  CUDA_CHECK(cudaEventRecord(start, stream));
   
   fuselink_recv_kernel<<<grid_dim, threads_per_block, 0, stream>>>(buffer, size, NULL, NULL, fifos);
   CUDA_CHECK(cudaEventRecord(end, stream));

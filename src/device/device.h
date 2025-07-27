@@ -5,8 +5,8 @@
 // #include <infiniband/verbs.h>
 #include <cuda.h>
 #include "debug.h"
+#include "common.h"
 
-#define RING_SIZE 16
 
 struct GpuMem {
   uint32_t device_id;
