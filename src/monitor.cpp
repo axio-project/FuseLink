@@ -103,14 +103,14 @@ void Monitor::start() {
     if (running_) return;
     
     running_ = true;
-    monitor_thread_ = std::thread(&Monitor::monitorThread, this);
+    // monitor_thread_ = std::thread(&Monitor::monitorThread, this);
 }
 
 void Monitor::stop() {
     if (shared_memory_) {
         shared_memory_->running.store(false);
     }
-    monitor_thread_.join();
+    // monitor_thread_.join();
 }
 
 size_t Monitor::getNicCount() const {

@@ -15,7 +15,7 @@
 // shm
 #include <sys/shm.h>
 
-#define MAX_NIC_NUM 16
+#define MAX_NIC_NUM 8
 #define NNIC_PER_GROUP 1
 #define NGROUP (MAX_NIC_NUM / NNIC_PER_GROUP)
 #define NCHANNELS_PER_NIC 2
@@ -32,11 +32,6 @@ inline int64_t get_timestamp() {
     ).count();
 }
 
-enum ChannelStatus {
-    CHANNEL_STATUS_IDLE = 0,
-    CHANNEL_STATUS_BUSY = 1,
-};
-
 enum NicStatus {
     NIC_STATUS_IDLE = 0,
     NIC_STATUS_BUSY = 1,
@@ -45,12 +40,14 @@ enum NicStatus {
 
 // Shared memory structure for IPC
 struct SharedMemory {
-    // ChannelStatus channel_tx_statuses[NGROUP][NNIC_PER_GROUP][NCHANNELS_PER_NIC];
-    // ChannelStatus channel_rx_statuses[NGROUP][NNIC_PER_GROUP][NCHANNELS_PER_NIC];
     NicStatus nic_tx_statuses[NGROUP][NNIC_PER_GROUP];
     NicStatus nic_rx_statuses[NGROUP][NNIC_PER_GROUP];
     int64_t nic_tx_last_active_ts[NGROUP][NNIC_PER_GROUP]; // timestamp
     int64_t nic_rx_last_active_ts[NGROUP][NNIC_PER_GROUP];
+
+    uint64_t nic_tx_load[NGROUP][NNIC_PER_GROUP];
+    uint64_t nic_rx_load[NGROUP][NNIC_PER_GROUP];
+
     std::atomic<bool> running;
 };
 

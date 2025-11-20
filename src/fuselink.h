@@ -4,6 +4,8 @@
 #include <vector>
 #include <map>
 #include "monitor.h"
+#include "checks.h"
+#include <assert.h>
 
 #include "nccl_net.h" // interaction with nccl net plugin
 
@@ -14,6 +16,34 @@ extern ncclNet_t ncclNetPlugin_v7;
 #define FUSELINK_STEPS 8
 
 #define UPDATE_HACKING_THRESHOLD (FUSELINK_STEPS * sizeof(void*))
+
+
+
+struct FuseLinkGidInfo {
+  uint8_t link_layer;
+  union ibv_gid localGid;
+  union ibv_gid remoteGid;
+};
+
+class FuseLinkComm {
+public:
+  FuseLinkComm(int dev) {
+    dev_ = dev;
+  }
+  int dev_;
+  struct ibv_qp* qp;
+  struct ibv_pd* pd;
+  struct ibv_cq* cq;
+  FuseLinkGidInfo gidInfo;
+
+  enum CommStatus {
+    RecvCommStatusInit = 0,
+    RecvCommStatusListening,
+    RecvCommStatusExchange,
+    RecvCommStatusReady
+  };
+  CommStatus status_;
+};
 
 struct ncclProxySubArgsForHacking {
   void* connection;
@@ -37,18 +67,16 @@ struct ncclProxySubArgsForHacking {
 }; // use by nccl, import this to hack sub->posted, sub->received, sub->transmitted, sub->done from nccl
 
 struct FuseLinkMemRegion {
-  uint32_t sz; // 32bit is enough
-  struct ibv_mr *mr[MAX_GPU_NUM + 1][MAX_NIC_NUM]; // registration on all NICs, with cpu mem on MAX_GPU_NUM index
-  CUdeviceptr addr[MAX_GPU_NUM + 1]; // use this addr to enable RDMA access
-  CUmemGenericAllocationHandle hdl[MAX_GPU_NUM]; // physical memory
-  int nrefs; // when 0, can be freed
-  pthread_mutex_t lock; // update nrefs
-};
-
-struct FuseLinkMemHandle {
   uintptr_t start_addr;
-  int dev; // mapped to which gpu, -1: cpumem
-  FuseLinkMemRegion *flmr;
+  int dev; // mapped to which gpu, -1 if cpu
+  int nic_dev; // mapped to which nic
+  uint32_t sz; // 32bit is enough
+  struct ibv_mr *mr[MAX_NIC_NUM + 1]; // registration on all NICs, with cpu mem on MAX_GPU_NUM index
+  CUdeviceptr addr[MAX_NIC_NUM + 1]; // use this addr to enable RDMA access, cast to void* for CPU memory access
+  CUmemGenericAllocationHandle hdl[MAX_NIC_NUM]; // physical memory, bind to addrs, dynamically bind to the addr
+  int nrefs; // when 0, can be freed
+  int nic2gpu[MAX_NIC_NUM]; // NIC index to GPU index, -1 if not mapped
+  pthread_mutex_t lock; // update nrefs
 };
 
 typedef std::map<void*, FuseLinkMemRegion*> Addr2FuseLinkMemRegion;
@@ -58,12 +86,6 @@ enum FuseLinkConnSetupState {
   FuseLinkConnSetupStatePending = 1,
   FuseLinkConnSetupStateReady = 2
 };
-
-// struct FuseLinkConnection {
-//   int dev;
-//   ibv_qp *qp;
-//   ibv_cq *cq;
-// };
 
 class FuseLinkConnManager {
 public:
@@ -313,9 +335,90 @@ private:
   std::map<int, int> rxchannel2dev_; // dev to comm.
 };
 
-void FuseLinkMemRegionInit(int nGPUs, void* base_addr, size_t size, int src_dev, int buffer_dev, FuseLinkMemRegion *flmr, bool is_cuda_mem);
+static inline void FuseLinkMemRegionInit(int nGPUs, int nNics, int* NIC2GPU, void* base_addr, size_t size, \
+   int src_dev, int target_nic_dev, FuseLinkMemRegion *flmr, bool is_cuda_mem) {
+  flmr->nrefs = 1;
+  flmr->dev = src_dev;
+  flmr->nic_dev = target_nic_dev;
+  // copy nic2gpu to flmr
+  for (int i = 0; i < nNics; i++) {
+    flmr->nic2gpu[i] = NIC2GPU[i];
+  }
+  for (int i = nNics; i < MAX_NIC_NUM; i++) {
+    flmr->nic2gpu[i] = -1;
+  }
+  pthread_mutex_init(&flmr->lock, NULL);
+
+  if (!is_cuda_mem) {
+    // allocate cpu memory
+    flmr->start_addr = (uintptr_t) base_addr;
+    flmr->dev = -1;
+    flmr->nic_dev = target_nic_dev;
+    flmr->addr[MAX_GPU_NUM] = (CUdeviceptr) base_addr;
+    flmr->mr[MAX_GPU_NUM] = nullptr;
+    // cut the lower bits
+    flmr->sz = static_cast<uint32_t>(size);
+    return;
+  }
+
+  size_t granularity = 0;
+  size_t aligned_sz = 0;
+  for (int i = 0; i < nNics; i++) {
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    assert(NIC2GPU[i] >= 0 && NIC2GPU[i] < MAX_GPU_NUM);
+    prop.location.id = NIC2GPU[i];
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    prop.allocFlags.gpuDirectRDMACapable = 1;
+    
+
+    FL_CUCHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    aligned_sz = ((size + granularity - 1) / granularity) * granularity;
+    
+    FL_CUCHECK(cuMemCreate(&flmr->hdl[i], aligned_sz, &prop, 0));
+    
+    // create address range
+    FL_CUCHECK(cuMemAddressReserve(&flmr->addr[i], aligned_sz, 0, 0, 0));
+    // map address to the physical memory
+    FL_CUCHECK(cuMemMap(flmr->addr[i], aligned_sz, 0, flmr->hdl[i], 0));
+    // set the mr to null, wait for registration
+    flmr->mr[i] = NULL;
+    CUmemAccessDesc accessDesc = {};
+    accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    accessDesc.location.id = src_dev; // enable access from the source gpu
+    accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    FL_CUCHECK(cuMemSetAccess(flmr->addr[i], aligned_sz, &accessDesc, 1));
+
+  }
+  
+  CUmemGenericAllocationHandle origin_hdl;
+  FL_CUCHECK(cuMemRetainAllocationHandle(&origin_hdl, base_addr));
+  FL_CUCHECK(cuMemUnmap((CUdeviceptr) base_addr, aligned_sz));
+  // get the original handle
+  FL_CUCHECK(cuMemRelease(origin_hdl));
+  
+  // printf("map buffer from gpu %d to target gpu %d for nic %d\n", src_dev, NIC2GPU[target_nic_dev], target_nic_dev);
+  FL_CUCHECK(cuMemMap((CUdeviceptr) base_addr, aligned_sz, 0, flmr->hdl[target_nic_dev], 0));
+  
+  // set access to base_addr
+  CUmemAccessDesc accessDesc = {};
+  accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  accessDesc.location.id = src_dev; // enable access from the source gpu
+  accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  FL_CUCHECK(cuMemSetAccess((CUdeviceptr) base_addr, aligned_sz, &accessDesc, 1));
+  
+  flmr->start_addr = (uintptr_t) base_addr;
+  flmr->dev = NIC2GPU[target_nic_dev];
+  flmr->nic_dev = target_nic_dev;
+  flmr->sz = aligned_sz;
+
+  return;
+}
 
 void FuseLinkMemRegionDestroy(FuseLinkMemRegion *flmr);
+
+void FuseLinkMemRegionRemap(FuseLinkMemRegion *flmr, int target_dev);
 
 #endif
 
